@@ -15,7 +15,9 @@ __pycache__/
 # Local config
 .env
 .env.local
-.streamlit/
+# Streamlit local configs (commit only config.toml)
+.streamlit/*
+!.streamlit/config.toml
 
 # OS
 .DS_Store
@@ -23,4 +25,3 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
-
