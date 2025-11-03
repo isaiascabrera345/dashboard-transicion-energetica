@@ -215,6 +215,7 @@ def build_renewable_ranking(energy_sa: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------#
 # Helpers VAR
 # ---------------------------#
+@st.cache_data(show_spinner=False, ttl=60*60)
 def compute_renewables_share_timeseries(e_country: pd.DataFrame) -> pd.Series:
     if e_country.empty: return pd.Series(dtype=float)
     mix, _ = build_mix_columns(e_country)
@@ -225,6 +226,7 @@ def compute_renewables_share_timeseries(e_country: pd.DataFrame) -> pd.Series:
     share = 100 * (ren_twh / gen.reindex(mix.index))
     return share.dropna()
 
+@st.cache_data(show_spinner=False, ttl=60*60)
 def adf_result(x: pd.Series):
     x = x.dropna()
     if len(x) < 8: return {"stat": np.nan, "p": np.nan}
@@ -234,6 +236,7 @@ def adf_result(x: pd.Series):
     except Exception:
         return {"stat": np.nan, "p": np.nan}
 
+@st.cache_data(show_spinner=False, ttl=60*10)
 def make_var_frame(country: str, yr: tuple, energy_sa: pd.DataFrame, co2_sa: pd.DataFrame) -> pd.DataFrame:
     e_c = energy_sa[(energy_sa["country"]==country) & (energy_sa["year"].between(yr[0], yr[1]))].copy()
     c_c = co2_sa[(co2_sa["country"]==country) & (co2_sa["year"].between(yr[0], yr[1]))].copy()
@@ -250,6 +253,7 @@ def make_var_frame(country: str, yr: tuple, energy_sa: pd.DataFrame, co2_sa: pd.
     df["elec_gen"]  = elec_gen.reindex(df.index)
     return df.dropna()
 
+@st.cache_data(show_spinner=False, ttl=60*10)
 def transform_for_var(df: pd.DataFrame, vars_sel: list, transform: str) -> pd.DataFrame:
     X = df[vars_sel].copy()
     if transform == "levels":
@@ -309,7 +313,11 @@ c_logo, c_title = st.columns([1,9], vertical_alignment="center")
 with c_logo:
     _logo = load_logo_bytes()
     if _logo is not None:
-        st.image(_logo, use_container_width=False)
+        # Compatibilidad: algunas versiones usan use_column_width en lugar de use_container_width
+        try:
+            st.image(_logo, use_container_width=False)
+        except TypeError:
+            st.image(_logo, use_column_width=False)
     else:
         st.warning("No se encontró el logo en /assets. El dashboard continúa sin logo.")
 with c_title:
