@@ -322,9 +322,9 @@ with c_logo:
     if _logo is not None:
         # Mostrar logo compacto para no tapar el contenido
         try:
-            st.image(_logo, width=56)
+            st.image(_logo, width=64)
         except TypeError:
-            st.image(_logo, width=56)
+            st.image(_logo, width=64)
     else:
         st.warning("No se encontró el logo en /assets. El dashboard continúa sin logo.")
 with c_title:
