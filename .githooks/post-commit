@@ -1,0 +1,8 @@
+#!/bin/sh
+# Auto-push the current branch after every commit
+branch=$(git rev-parse --abbrev-ref HEAD)
+remote=${1:-origin}
+if [ -n "$branch" ]; then
+  git push -u "$remote" "$branch"
+fi
+
