@@ -1,0 +1,63 @@
+/* ===== ICO Systems — Tema minimal pro ===== */
+:root{
+  --bg:#0f1216;
+  --panel:#141922;
+  --text:#e7e9ee;
+  --muted:#9aa3af;
+  --accent:#00c2a8;    /* turquesa profesional */
+  --accent-2:#6ee7d2;  /* turquesa claro para hovers */
+}
+
+/* Fondo y tipografía */
+html, body, [data-testid="stAppViewContainer"]{
+  background: var(--bg) !important;
+  color: var(--text) !important;
+}
+
+/* Contenedor principal más respirado */
+.main .block-container{
+  padding-top: 1.0rem;
+  padding-left: 1.2rem;
+  padding-right: 1.2rem;
+}
+
+/* ===== Topbar con logo y título ===== */
+.topbar{
+  display:flex; align-items:center; gap:16px;
+  padding:8px 8px 2px 8px; border-radius:12px;
+}
+.topbar .brand{
+  display:flex; align-items:center; gap:14px;
+}
+.topbar img{ height:42px; width:auto; }
+.topbar h1{
+  margin:0; font-size:1.6rem; letter-spacing:.2px;
+}
+.topbar .subtitle{
+  color:var(--muted); font-size:.95rem; margin-top:-2px;
+}
+
+/* Tabs marcadas con acento */
+.stTabs [data-baseweb="tab"]{ font-weight:600; }
+.stTabs [aria-selected="true"]{
+  color:var(--accent);
+  border-bottom:2px solid var(--accent);
+}
+
+/* KPIs más grandes */
+[data-testid="stMetricValue"]{ font-size:1.8rem; }
+
+/* Tarjetas Plotly con leve elevación */
+.element-container .stPlotlyChart{
+  border-radius:12px; padding:6px;
+  background: rgba(255,255,255,.02);
+  box-shadow: 0 2px 14px rgba(0,0,0,.12);
+}
+
+/* Footer */
+.footer{
+  margin-top: 8px; padding-top:8px; color:var(--muted);
+  font-size:.9rem; text-align:center;
+  border-top:1px solid rgba(255,255,255,.08);
+}
+.footer b{ color:var(--text); }
