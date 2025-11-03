@@ -320,11 +320,11 @@ c_logo, c_title = st.columns([1,9], vertical_alignment="center")
 with c_logo:
     _logo = load_logo_bytes()
     if _logo is not None:
-        # Compatibilidad: algunas versiones usan use_column_width en lugar de use_container_width
+        # Mostrar logo compacto para no tapar el contenido
         try:
-            st.image(_logo, use_container_width=False)
+            st.image(_logo, width=56)
         except TypeError:
-            st.image(_logo, use_column_width=False)
+            st.image(_logo, width=56)
     else:
         st.warning("No se encontró el logo en /assets. El dashboard continúa sin logo.")
 with c_title:
