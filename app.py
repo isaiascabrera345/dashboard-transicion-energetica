@@ -9,6 +9,7 @@
 # ============================================================
 
 from pathlib import Path
+import os
 from datetime import datetime
 import itertools
 import numpy as np
@@ -72,9 +73,13 @@ def set_plotly_theme():
     ]
     px.defaults.template = "icosystems_dark"
     px.defaults.color_continuous_scale = "Turbo"
+    px.defaults.height = 540
 
 inject_local_css()
 set_plotly_theme()
+
+# Production mode (Render/CI) for lighter defaults
+PRODUCTION = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("STREAMLIT_PROD"))
 
 # ---------------------------#
 # Parámetros / países
@@ -175,6 +180,7 @@ def compute_renewable_share_row(row: pd.Series) -> float | None:
         return None
     return 100.0 * ren / gen
 
+@st.cache_data(show_spinner=False, ttl=60*60)
 def build_mix_columns(df_country: pd.DataFrame) -> tuple[pd.DataFrame, list]:
     work = df_country.copy()
     if work.empty: return pd.DataFrame(), []
@@ -195,6 +201,7 @@ def build_mix_columns(df_country: pd.DataFrame) -> tuple[pd.DataFrame, list]:
     df_mix = pd.concat(pieces, axis=1); df_mix.index.name = "year"
     return df_mix.sort_index(), used_cols
 
+@st.cache_data(show_spinner=False, ttl=60*60)
 def build_renewable_ranking(energy_sa: pd.DataFrame) -> pd.DataFrame:
     tmp = energy_sa.dropna(subset=["iso_code"])
     if tmp.empty: return pd.DataFrame()
