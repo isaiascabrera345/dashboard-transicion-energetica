@@ -31,6 +31,21 @@ st.set_page_config(
 
 # ===== CSS y tema Plotly =====
 def inject_local_css(path: str = "assets/style.css"):
+    # Asegura fuentes de íconos Material (evita textos como 'keyboard_double_arrow_right')
+    st.markdown(
+        """
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200">
+        <style>
+        .material-symbols-rounded, .material-icons, [class*="material-icons"]{
+            font-family: 'Material Symbols Rounded','Material Icons',sans-serif !important;
+            font-weight: normal; font-style: normal; font-size: 24px; line-height: 1;
+            letter-spacing: normal; text-transform: none; display: inline-block; white-space: nowrap; direction: ltr;
+            -webkit-font-feature-settings: 'liga'; -webkit-font-smoothing: antialiased;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     p = Path(path)
     if p.exists():
         st.markdown(f"<style>{p.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
