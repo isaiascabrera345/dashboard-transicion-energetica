@@ -1,4 +1,4 @@
-# Envs
+﻿# Envs
 .venv/
 venv/
 ENV/
@@ -25,3 +25,5 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+assets/*.csv
