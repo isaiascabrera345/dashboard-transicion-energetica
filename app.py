@@ -87,9 +87,11 @@ set_plotly_theme()
 # Production mode (Render/CI) for lighter defaults
 PRODUCTION = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("STREAMLIT_PROD"))
 
-def _emit_streamlit_info(message: str) -> None:
-    """Muestra info en Streamlit cuando hay contexto; siempre registra en logging."""
+def _emit_streamlit_info(message: str, *, show_to_user: bool = False) -> None:
+    """Registra mensajes informativos; opcionalmente los muestra en la UI."""
     logging.getLogger(__name__).info(message)
+    if PRODUCTION and not show_to_user:
+        return
     if get_script_run_ctx is None:
         return
     try:
