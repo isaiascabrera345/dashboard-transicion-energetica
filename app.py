@@ -1,4 +1,4 @@
-# app.py
+﻿# app.py
 # ============================================================
 # DASHBOARD: Transición Energética — Sudamérica (OWID)
 # - Datos OWID energía + CO2 (CSVs públicos)
@@ -108,6 +108,14 @@ SOUTH_AMERICA_ISO = ["ARG","BOL","BRA","CHL","COL","ECU","GUY","PRY","PER","SUR"
 OWID_ENERGY_URL = "https://raw.githubusercontent.com/owid/energy-data/master/owid-energy-data.csv"
 OWID_CO2_URL    = "https://raw.githubusercontent.com/owid/co2-data/master/owid-co2-data.csv"
 OWID_CHUNK_SIZE = 10_000
+
+VAR_START_YEAR = 2000
+VAR_END_YEAR = 2022
+VAR_MIN_OBS = 12
+VAR_EXCLUDED_COUNTRIES = {
+    "Guyana": "sin series consistentes de generación/CO₂/PIB en 2000-2022",
+    "Suriname": "sin series consistentes de generación/CO₂/PIB en 2000-2022",
+}
 
 ENERGY_USECOLS = [
     "iso_code","country","year","electricity_generation",
@@ -390,21 +398,58 @@ def make_var_frame(country: str, yr: tuple, energy_sa: pd.DataFrame, co2_sa: pd.
     if gdp_usd is not None: df["gdp"] = gdp_usd.reindex(df.index)
     df["ren_share"] = ren_share.reindex(df.index)
     df["elec_gen"]  = elec_gen.reindex(df.index)
-    return df.dropna()
+    df = df.sort_index()
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna()
+    return df.astype("float64")
 
 @st.cache_data(show_spinner=False, ttl=60*10)
 def transform_for_var(df: pd.DataFrame, vars_sel: list, transform: str) -> pd.DataFrame:
     X = df[vars_sel].copy()
+    X = X.apply(pd.to_numeric, errors="coerce").sort_index()
     if transform == "levels":
-        return X.dropna()
+        res = X.dropna()
     elif transform == "logdiff":
-        for c in X.columns:
-            X[c] = np.log(X[c]).replace([-np.inf, np.inf], np.nan)
-        return X.diff().dropna()
+        X_log = X.apply(lambda s: np.log(s).replace([-np.inf, np.inf], np.nan))
+        res = X_log.diff().dropna()
     elif transform == "pctchg":
-        return X.pct_change().dropna()
+        res = X.pct_change().dropna()
     else:
-        return X.dropna()
+        res = X.dropna()
+    return res.astype("float64")
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def summarize_var_availability(
+    energy_sa: pd.DataFrame,
+    co2_sa: pd.DataFrame,
+    start_year: int,
+    end_year: int,
+    min_obs: int = VAR_MIN_OBS,
+) -> dict[str, dict]:
+    """Devuelve disponibilidad del VAR por país en la ventana uniforme."""
+    summary: dict[str, dict] = {}
+    countries = sorted(set(energy_sa["country"].unique()) | set(co2_sa["country"].unique()))
+    for country in countries:
+        df = make_var_frame(country, (start_year, end_year), energy_sa, co2_sa)
+        rows = int(len(df))
+        if rows >= min_obs:
+            summary[country] = {"rows": rows, "status": "ready", "reason": ""}
+        elif rows > 0:
+            summary[country] = {
+                "rows": rows,
+                "status": "insufficient",
+                "reason": f"{rows} observaciones válidas en {start_year}-{end_year}",
+            }
+        else:
+            summary[country] = {
+                "rows": rows,
+                "status": "insufficient",
+                "reason": "sin combinaciones completas de CO₂, PIB y generación",
+            }
+    for name, reason in VAR_EXCLUDED_COUNTRIES.items():
+        summary[name] = {"rows": 0, "status": "excluded", "reason": reason}
+    return summary
 
 # ---------------------------#
 # Sidebar (controles)
@@ -429,6 +474,19 @@ for w in (validate_energy(energy) + validate_co2(co2)):
 # Filtrar Sudamérica
 energy_sa = energy[energy["iso_code"].isin(SOUTH_AMERICA_ISO)].copy()
 co2_sa    = co2[co2["iso_code"].isin(SOUTH_AMERICA_ISO)].copy()
+
+energy_var = energy_sa[energy_sa["year"].between(VAR_START_YEAR, VAR_END_YEAR)].copy()
+co2_var    = co2_sa[co2_sa["year"].between(VAR_START_YEAR, VAR_END_YEAR)].copy()
+
+VAR_COUNTRY_META = summarize_var_availability(
+    energy_var, co2_var, VAR_START_YEAR, VAR_END_YEAR, VAR_MIN_OBS
+)
+VAR_READY_COUNTRIES = sorted(
+    [c for c, meta in VAR_COUNTRY_META.items() if meta["status"] == "ready"]
+)
+VAR_LIMITED_COUNTRIES = {
+    c: meta for c, meta in VAR_COUNTRY_META.items() if meta["status"] != "ready"
+}
 
 # Controles
 country_list = list_sa_countries(energy)
@@ -483,7 +541,7 @@ if not e_c.empty:
     mix_c, _used = build_mix_columns(e_c.sort_values("year"))
     if not mix_c.empty:
         last_year = mix_c.index.max()
-        gen_last = e_c.loc[e_c["year"]==last_year, "electricity_generation"]
+        gen_last = e_c.loc[e_c["year"]==last_year, "electricity_generation"].dropna()
         gen_last = None if gen_last.empty else float(gen_last.iloc[0])
         if gen_last is not None:
             row = pd.concat([mix_c.loc[last_year], pd.Series({"electricity_generation": gen_last})])
@@ -598,6 +656,22 @@ with tab_map:
 # ---- Modelo VAR ----
 with tab_var:
     st.subheader(f"Modelo VAR — {country}")
+    st.caption(
+        f"Ventana del modelo: {VAR_START_YEAR}–{VAR_END_YEAR} "
+        f"(se requieren ≥{VAR_MIN_OBS} observaciones con CO₂, PIB, renovables y generación)."
+    )
+    if VAR_LIMITED_COUNTRIES:
+        limited_text = ", ".join(
+            f"{name} ({meta['reason']})" for name, meta in VAR_LIMITED_COUNTRIES.items()
+        )
+        st.warning("Países sin VAR disponible: " + limited_text)
+    st.info(
+        "Instrucciones VAR:\n"
+        "1. Selecciona un país con cobertura completa.\n"
+        "2. Elige al menos dos variables (lo ideal son CO₂, PIB y % renovables).\n"
+        "3. Mantén el rango fijo 2000–2022; los controles de arriba no afectan al modelo.\n"
+        "4. Revisa las pruebas de ADF antes de estimar y asegura ≥12 observaciones tras la transformación."
+    )
 
     with st.expander("Configuración del modelo", expanded=True):
         vars_catalog = {
@@ -616,8 +690,12 @@ with tab_var:
         irf_h   = st.slider("Horizonte IRF (años)", 1, 12, 8)
         run = st.button("🧮 Estimar VAR", type="primary")
 
-    df_var = make_var_frame(country, yr, energy_sa, co2_sa)
-    if df_var.empty:
+    var_window = (VAR_START_YEAR, VAR_END_YEAR)
+    df_var = make_var_frame(country, var_window, energy_var, co2_var)
+    if country not in VAR_READY_COUNTRIES:
+        reason = VAR_COUNTRY_META.get(country, {}).get("reason", "datos insuficientes.")
+        st.info(f"No es posible estimar el VAR para {country}: {reason}")
+    elif df_var.empty:
         st.info("No hay suficientes datos combinados para este país y rango.")
     elif len(vars_sel) < 2:
         st.info("Selecciona al menos 2 variables para el VAR.")
