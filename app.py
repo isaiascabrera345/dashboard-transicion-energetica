@@ -1,4 +1,4 @@
-# app.py
+﻿# app.py
 # ============================================================
 # DASHBOARD: Transición Energética — Sudamérica (OWID)
 # - Datos OWID energía + CO2 (CSVs públicos)
@@ -87,16 +87,81 @@ PRODUCTION = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_UR
 SOUTH_AMERICA_ISO = ["ARG","BOL","BRA","CHL","COL","ECU","GUY","PRY","PER","SUR","URY","VEN"]
 OWID_ENERGY_URL = "https://raw.githubusercontent.com/owid/energy-data/master/owid-energy-data.csv"
 OWID_CO2_URL    = "https://raw.githubusercontent.com/owid/co2-data/master/owid-co2-data.csv"
+OWID_CHUNK_SIZE = 10_000
+
+ENERGY_USECOLS = [
+    "iso_code","country","year","electricity_generation",
+    "electricity_from_coal","electricity_from_gas","electricity_from_oil",
+    "electricity_from_hydro","electricity_from_nuclear","electricity_from_wind",
+    "electricity_from_solar","electricity_from_biofuel","electricity_from_bioenergy",
+    "electricity_from_other_renewables",
+    "coal_share_elec","gas_share_elec","oil_share_elec","hydro_share_elec",
+    "nuclear_share_elec","wind_share_elec","solar_share_elec",
+    "bioenergy_share_elec","other_renewables_share_elec",
+]
+ENERGY_FLOAT_COLS = [
+    "electricity_generation",
+    "electricity_from_coal","electricity_from_gas","electricity_from_oil",
+    "electricity_from_hydro","electricity_from_nuclear","electricity_from_wind",
+    "electricity_from_solar","electricity_from_biofuel","electricity_from_bioenergy",
+    "electricity_from_other_renewables",
+    "coal_share_elec","gas_share_elec","oil_share_elec","hydro_share_elec",
+    "nuclear_share_elec","wind_share_elec","solar_share_elec",
+    "bioenergy_share_elec","other_renewables_share_elec",
+]
+
+CO2_USECOLS = ["iso_code","country","year","co2","co2_per_capita","gdp"]
+CO2_FLOAT_COLS = ["co2","co2_per_capita","gdp"]
 
 # ---------------------------#
 # Carga y validación de datos
 # ---------------------------#
+def _read_owid_subset(url: str, usecols: list[str], float_cols: list[str]) -> pd.DataFrame:
+    """Lee el CSV remoto por chunks, filtra Sudamérica y minimiza memoria."""
+    try:
+        iterator = pd.read_csv(
+            url,
+            usecols=usecols,
+            chunksize=OWID_CHUNK_SIZE,
+            dtype_backend="numpy_nullable",
+        )
+    except TypeError:
+        iterator = pd.read_csv(url, usecols=usecols, chunksize=OWID_CHUNK_SIZE)
+
+    frames = []
+    for chunk in iterator:
+        filtered = chunk[chunk["iso_code"].isin(SOUTH_AMERICA_ISO)]
+        if not filtered.empty:
+            frames.append(filtered)
+
+    if not frames:
+        return pd.DataFrame(columns=usecols)
+
+    df = pd.concat(frames, ignore_index=True)
+
+    for cat_col in ("iso_code", "country"):
+        if cat_col in df.columns:
+            df[cat_col] = df[cat_col].astype("category")
+
+    if "year" in df.columns:
+        df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int16")
+
+    for col in float_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Float32")
+
+    return df
+
 @st.cache_data(show_spinner=True, ttl=60*60)
 def load_owid_energy() -> pd.DataFrame:
+    if PRODUCTION:
+        return _read_owid_subset(OWID_ENERGY_URL, ENERGY_USECOLS, ENERGY_FLOAT_COLS)
     return pd.read_csv(OWID_ENERGY_URL)
 
 @st.cache_data(show_spinner=True, ttl=60*60)
 def load_owid_co2() -> pd.DataFrame:
+    if PRODUCTION:
+        return _read_owid_subset(OWID_CO2_URL, CO2_USECOLS, CO2_FLOAT_COLS)
     return pd.read_csv(OWID_CO2_URL)
 
 def validate_energy(df: pd.DataFrame) -> list:
