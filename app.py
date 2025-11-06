@@ -1,4 +1,4 @@
-﻿# app.py
+# app.py
 # ============================================================
 # DASHBOARD: Transición Energética — Sudamérica (OWID)
 # - Datos OWID energía + CO2 (CSVs públicos)
@@ -12,6 +12,7 @@ from pathlib import Path
 import os
 from datetime import datetime
 import itertools
+import logging
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -19,6 +20,11 @@ import plotly.express as px
 import plotly.io as pio
 from statsmodels.tsa.api import VAR
 from statsmodels.tsa.stattools import adfuller
+
+try:
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+except ModuleNotFoundError:  # streamlit < 1.20 o cambios internos
+    get_script_run_ctx = None
 
 # ---------------------------#
 # Configuración de la app
@@ -81,6 +87,18 @@ set_plotly_theme()
 # Production mode (Render/CI) for lighter defaults
 PRODUCTION = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("STREAMLIT_PROD"))
 
+def _emit_streamlit_info(message: str) -> None:
+    """Muestra info en Streamlit cuando hay contexto; siempre registra en logging."""
+    logging.getLogger(__name__).info(message)
+    if get_script_run_ctx is None:
+        return
+    try:
+        if get_script_run_ctx() is not None:
+            st.info(message)
+    except Exception:
+        # Si Streamlit no tiene contexto (tests, scripts), ignoramos.
+        pass
+
 # ---------------------------#
 # Parámetros / países
 # ---------------------------#
@@ -112,21 +130,58 @@ ENERGY_FLOAT_COLS = [
 
 CO2_USECOLS = ["iso_code","country","year","co2","co2_per_capita","gdp"]
 CO2_FLOAT_COLS = ["co2","co2_per_capita","gdp"]
+ENERGY_REQUIRED_COLS = ["iso_code","country","year","electricity_generation"]
+CO2_REQUIRED_COLS = ["iso_code","country","year","co2"]
 
 # ---------------------------#
 # Carga y validación de datos
 # ---------------------------#
-def _read_owid_subset(url: str, usecols: list[str], float_cols: list[str]) -> pd.DataFrame:
+def _read_owid_subset(
+    url: str,
+    usecols: list[str],
+    float_cols: list[str],
+    required_cols: list[str] | None = None,
+) -> pd.DataFrame:
     """Lee el CSV remoto por chunks, filtra Sudamérica y minimiza memoria."""
+    required = required_cols or []
+    try:
+        header_cols = pd.read_csv(url, nrows=0).columns
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo leer la cabecera del dataset OWID: {url}") from exc
+
+    available = set(header_cols)
+    missing_required = [col for col in required if col not in available]
+    if missing_required:
+        raise ValueError(
+            "Faltan columnas esenciales en OWID: "
+            + ", ".join(missing_required)
+            + ". Actualiza la lista de columnas o revisa el dataset de origen."
+        )
+
+    selected_cols: list[str] = []
+    for col in usecols:
+        if col in available and col not in selected_cols:
+            selected_cols.append(col)
+    for col in required:
+        if col in available and col not in selected_cols:
+            selected_cols.append(col)
+
+    optional_missing = [col for col in usecols if col not in available]
+    if optional_missing:
+        _emit_streamlit_info(
+            "Columnas OWID no disponibles y omitidas: "
+            + ", ".join(optional_missing)
+        )
+
     try:
         iterator = pd.read_csv(
             url,
-            usecols=usecols,
+            usecols=selected_cols,
             chunksize=OWID_CHUNK_SIZE,
             dtype_backend="numpy_nullable",
         )
     except TypeError:
-        iterator = pd.read_csv(url, usecols=usecols, chunksize=OWID_CHUNK_SIZE)
+        iterator = pd.read_csv(url, usecols=selected_cols, chunksize=OWID_CHUNK_SIZE)
 
     frames = []
     for chunk in iterator:
@@ -155,13 +210,23 @@ def _read_owid_subset(url: str, usecols: list[str], float_cols: list[str]) -> pd
 @st.cache_data(show_spinner=True, ttl=60*60)
 def load_owid_energy() -> pd.DataFrame:
     if PRODUCTION:
-        return _read_owid_subset(OWID_ENERGY_URL, ENERGY_USECOLS, ENERGY_FLOAT_COLS)
+        return _read_owid_subset(
+            OWID_ENERGY_URL,
+            ENERGY_USECOLS,
+            ENERGY_FLOAT_COLS,
+            required_cols=ENERGY_REQUIRED_COLS,
+        )
     return pd.read_csv(OWID_ENERGY_URL)
 
 @st.cache_data(show_spinner=True, ttl=60*60)
 def load_owid_co2() -> pd.DataFrame:
     if PRODUCTION:
-        return _read_owid_subset(OWID_CO2_URL, CO2_USECOLS, CO2_FLOAT_COLS)
+        return _read_owid_subset(
+            OWID_CO2_URL,
+            CO2_USECOLS,
+            CO2_FLOAT_COLS,
+            required_cols=CO2_REQUIRED_COLS,
+        )
     return pd.read_csv(OWID_CO2_URL)
 
 def validate_energy(df: pd.DataFrame) -> list:
