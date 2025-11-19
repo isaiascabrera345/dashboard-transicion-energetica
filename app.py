@@ -156,6 +156,8 @@ FORECAST_INDICATORS = {
 FORECAST_MIN_OBS = 8
 FORECAST_MAX_PDQ = 2
 ELASTICITY_MIN_OBS = 6
+DEFAULT_FORECAST_H = 5
+POPULAR_COUNTRIES = ["Brazil", "Argentina", "Colombia", "Chile"]
 
 # ---------------------------#
 # Carga y validación de datos
@@ -561,6 +563,25 @@ def elasticity_league_table(co2_sa: pd.DataFrame, min_obs: int = ELASTICITY_MIN_
     ranking = ranking.sort_values("elasticity", ascending=False)
     return ranking
 
+@st.cache_data(show_spinner=False, ttl=60*30)
+def precompute_default_forecasts(
+    popular_countries: list[str],
+    energy_sa: pd.DataFrame,
+    co2_sa: pd.DataFrame,
+) -> dict[tuple[str, str], dict]:
+    precomputed: dict[tuple[str, str], dict] = {}
+    for country in popular_countries:
+        for indicator_key in FORECAST_INDICATORS.keys():
+            series = get_indicator_series(country, indicator_key, energy_sa, co2_sa)
+            if series.empty or len(series) < FORECAST_MIN_OBS:
+                continue
+            try:
+                result = auto_arima_forecast(series, DEFAULT_FORECAST_H)
+            except Exception:
+                continue
+            precomputed[(country, indicator_key)] = result
+    return precomputed
+
 # ---------------------------#
 # Sidebar (controles)
 # ---------------------------#
@@ -584,6 +605,7 @@ for w in (validate_energy(energy) + validate_co2(co2)):
 # Filtrar Sudamérica con caché liviano
 energy_sa = filter_south_america(energy)
 co2_sa    = filter_south_america(co2)
+POPULAR_FORECASTS = precompute_default_forecasts(POPULAR_COUNTRIES, energy_sa, co2_sa)
 
 # Controles
 country_list = list_sa_countries(energy)
@@ -764,7 +786,7 @@ with tab_forecast:
     )
     indicator_meta = FORECAST_INDICATORS[indicator_key]
     st.caption(indicator_meta["description"])
-    horizon = st.slider("Horizonte de pronóstico (años)", 1, 10, 5)
+    horizon = st.slider("Horizonte de pronóstico (años)", 1, 10, DEFAULT_FORECAST_H)
     series = get_indicator_series(country, indicator_key, energy_sa, co2_sa)
     if series.empty:
         st.info("No hay datos históricos suficientes para este indicador/país.")
@@ -774,14 +796,11 @@ with tab_forecast:
         if min_year == max_year:
             st.info("Se necesitan >=2 observaciones para entrenar el ARIMA.")
         else:
-            default_start = max(min_year, max_year - 30)
-            if default_start > max_year:
-                default_start = min_year
             hist_range = st.slider(
                 "Rango histórico utilizado",
                 min_year,
                 max_year,
-                (default_start, max_year),
+                (min_year, max_year),
                 key=f"forecast_range_{indicator_key}_{country}",
             )
             mask = (series.index >= hist_range[0]) & (series.index <= hist_range[1])
@@ -792,12 +811,22 @@ with tab_forecast:
                     "Amplía el rango histórico."
                 )
             else:
-                try:
-                    forecast_res = auto_arima_forecast(subset, horizon)
-                except Exception as exc:
-                    st.error("No se pudo ajustar el ARIMA para este indicador.")
-                    st.exception(exc)
+                precalc_key = (country, indicator_key)
+                use_precalc = (
+                    precalc_key in POPULAR_FORECASTS
+                    and hist_range == (min_year, max_year)
+                    and horizon == DEFAULT_FORECAST_H
+                )
+                if use_precalc:
+                    forecast_res = POPULAR_FORECASTS[precalc_key]
                 else:
+                    try:
+                        forecast_res = auto_arima_forecast(subset, horizon)
+                    except Exception as exc:
+                        st.error("No se pudo ajustar el ARIMA para este indicador.")
+                        st.exception(exc)
+                        forecast_res = None
+                if forecast_res:
                     fc_df = forecast_res["forecast"]
                     last_fc = float(fc_df["valor"].iloc[-1])
                     delta = last_fc - forecast_res["last_value"]
