@@ -5,21 +5,20 @@
 # - Mezcla robusta (TWh directo o shares×generación)
 # - Tema visual minimal (CSS externo + Plotly theme)
 # - Mapa grande, tabs limpias, keys por gráfico
-# - Pestaña VAR con AIC, ADF, Granger e IRFs (colores diferenciables)
+# - Pestaña de pronósticos ARIMA + elasticidad CO₂/PIB
 # ============================================================
 
 from pathlib import Path
 import os
 from datetime import datetime
-import itertools
 import logging
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 import plotly.io as pio
-from statsmodels.tsa.api import VAR
-from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.arima.model import ARIMA
 
 try:
     from streamlit.runtime.scriptrunner import get_script_run_ctx
@@ -109,20 +108,13 @@ OWID_ENERGY_URL = "https://raw.githubusercontent.com/owid/energy-data/master/owi
 OWID_CO2_URL    = "https://raw.githubusercontent.com/owid/co2-data/master/owid-co2-data.csv"
 OWID_CHUNK_SIZE = 10_000
 
-VAR_START_YEAR = 2000
-VAR_END_YEAR = 2022
-VAR_MIN_OBS = 12
-VAR_EXCLUDED_COUNTRIES = {
-    "Guyana": "sin series consistentes de generación/CO₂/PIB en 2000-2022",
-    "Suriname": "sin series consistentes de generación/CO₂/PIB en 2000-2022",
-}
-
 ENERGY_USECOLS = [
     "iso_code","country","year","electricity_generation",
     "electricity_from_coal","electricity_from_gas","electricity_from_oil",
     "electricity_from_hydro","electricity_from_nuclear","electricity_from_wind",
     "electricity_from_solar","electricity_from_biofuel","electricity_from_bioenergy",
     "electricity_from_other_renewables",
+    "primary_energy_consumption",
     "coal_share_elec","gas_share_elec","oil_share_elec","hydro_share_elec",
     "nuclear_share_elec","wind_share_elec","solar_share_elec",
     "bioenergy_share_elec","other_renewables_share_elec",
@@ -133,6 +125,7 @@ ENERGY_FLOAT_COLS = [
     "electricity_from_hydro","electricity_from_nuclear","electricity_from_wind",
     "electricity_from_solar","electricity_from_biofuel","electricity_from_bioenergy",
     "electricity_from_other_renewables",
+    "primary_energy_consumption",
     "coal_share_elec","gas_share_elec","oil_share_elec","hydro_share_elec",
     "nuclear_share_elec","wind_share_elec","solar_share_elec",
     "bioenergy_share_elec","other_renewables_share_elec",
@@ -142,6 +135,27 @@ CO2_USECOLS = ["iso_code","country","year","co2","co2_per_capita","gdp"]
 CO2_FLOAT_COLS = ["co2","co2_per_capita","gdp"]
 ENERGY_REQUIRED_COLS = ["iso_code","country","year","electricity_generation"]
 CO2_REQUIRED_COLS = ["iso_code","country","year","co2"]
+
+FORECAST_INDICATORS = {
+    "co2_total": {
+        "label": "CO₂ total (Mt)",
+        "unit": "Mt",
+        "description": "Emisiones totales anuales de CO₂ reportadas por OWID.",
+    },
+    "renewables_share": {
+        "label": "Participación de renovables en generación (%)",
+        "unit": "%",
+        "description": "Share estimado de renovables dentro de la generación eléctrica.",
+    },
+    "primary_energy": {
+        "label": "Consumo primario de energía (TWh)",
+        "unit": "TWh",
+        "description": "Consumo primario de energía reportado por OWID.",
+    },
+}
+FORECAST_MIN_OBS = 8
+FORECAST_MAX_PDQ = 2
+ELASTICITY_MIN_OBS = 6
 
 # ---------------------------#
 # Carga y validación de datos
@@ -359,97 +373,178 @@ def build_renewable_ranking(energy_sa: pd.DataFrame) -> pd.DataFrame:
     last["ren_share"] = shares
     return last[["country","iso_code","year","ren_share"]].dropna().sort_values("ren_share", ascending=False)
 
-# ---------------------------#
-# Helpers VAR
-# ---------------------------#
 @st.cache_data(show_spinner=False, ttl=60*60)
 def compute_renewables_share_timeseries(e_country: pd.DataFrame) -> pd.Series:
-    if e_country.empty: return pd.Series(dtype=float)
+    if e_country.empty:
+        return pd.Series(dtype=float)
     mix, _ = build_mix_columns(e_country)
-    if mix.empty: return pd.Series(dtype=float)
-    gen = e_country.setindex("year")["electricity_generation"] if "setindex" in dir(e_country) else e_country.set_index("year")["electricity_generation"]
-    ren_cols = [c for c in mix.columns if any(kw in c for kw in ["hydro","wind","solar","biofuel","bioenergy","other_renewables"])]
+    if mix.empty:
+        return pd.Series(dtype=float)
+    gen = e_country.set_index("year")["electricity_generation"]
+    ren_cols = [c for c in mix.columns if any(kw in c for kw in [
+        "hydro","wind","solar","biofuel","bioenergy","other_renewables"
+    ])]
     ren_twh = mix[ren_cols].sum(axis=1)
     share = 100 * (ren_twh / gen.reindex(mix.index))
     return share.dropna()
 
-@st.cache_data(show_spinner=False, ttl=60*60)
-def adf_result(x: pd.Series):
-    x = x.dropna()
-    if len(x) < 8: return {"stat": np.nan, "p": np.nan}
-    try:
-        stat, p, *_ = adfuller(x, autolag="AIC")
-        return {"stat": stat, "p": p}
-    except Exception:
-        return {"stat": np.nan, "p": np.nan}
+# ---------------------------#
+# Pronósticos ARIMA (helpers)
+# ---------------------------#
+def _clean_year_series(series: pd.Series) -> pd.Series:
+    if series is None or series.empty:
+        return pd.Series(dtype="float64")
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return pd.Series(dtype="float64")
+    idx = pd.Series(s.index, dtype="object")
+    years = pd.to_numeric(idx, errors="coerce")
+    mask = years.notna()
+    s = s.iloc[mask.values]
+    if s.empty:
+        return pd.Series(dtype="float64")
+    years = years.loc[mask].astype("int64").to_numpy()
+    s.index = pd.Index(years, name="year")
+    s = s[~s.index.duplicated(keep="last")]
+    return s.sort_index().astype("float64")
 
 @st.cache_data(show_spinner=False, ttl=60*10)
-def make_var_frame(country: str, yr: tuple, energy_sa: pd.DataFrame, co2_sa: pd.DataFrame) -> pd.DataFrame:
-    e_c = energy_sa[(energy_sa["country"]==country) & (energy_sa["year"].between(yr[0], yr[1]))].copy()
-    c_c = co2_sa[(co2_sa["country"]==country) & (co2_sa["year"].between(yr[0], yr[1]))].copy()
-    if e_c.empty or c_c.empty: return pd.DataFrame()
-    ren_share = compute_renewables_share_timeseries(e_c)  # %
-    elec_gen  = e_c.set_index("year")["electricity_generation"]
-    co2_mt    = c_c.set_index("year")["co2"]   # Mt
-    gdp_usd   = c_c.set_index("year")["gdp"] if "gdp" in c_c.columns else None
-    df = pd.DataFrame(index=sorted(set(elec_gen.index) & set(co2_mt.index)))
-    df.index.name = "year"
-    df["co2"] = co2_mt.reindex(df.index)
-    if gdp_usd is not None: df["gdp"] = gdp_usd.reindex(df.index)
-    df["ren_share"] = ren_share.reindex(df.index)
-    df["elec_gen"]  = elec_gen.reindex(df.index)
-    df = df.sort_index()
-    for col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna()
-    return df.astype("float64")
-
-@st.cache_data(show_spinner=False, ttl=60*10)
-def transform_for_var(df: pd.DataFrame, vars_sel: list, transform: str) -> pd.DataFrame:
-    X = df[vars_sel].copy()
-    X = X.apply(pd.to_numeric, errors="coerce").sort_index()
-    if transform == "levels":
-        res = X.dropna()
-    elif transform == "logdiff":
-        X_log = X.apply(lambda s: np.log(s).replace([-np.inf, np.inf], np.nan))
-        res = X_log.diff().dropna()
-    elif transform == "pctchg":
-        res = X.pct_change().dropna()
-    else:
-        res = X.dropna()
-    return res.astype("float64")
-
-@st.cache_data(show_spinner=False, ttl=60*60)
-def summarize_var_availability(
+def get_indicator_series(
+    country: str,
+    indicator_key: str,
     energy_sa: pd.DataFrame,
     co2_sa: pd.DataFrame,
-    start_year: int,
-    end_year: int,
-    min_obs: int = VAR_MIN_OBS,
-) -> dict[str, dict]:
-    """Devuelve disponibilidad del VAR por país en la ventana uniforme."""
-    summary: dict[str, dict] = {}
-    countries = sorted(set(energy_sa["country"].unique()) | set(co2_sa["country"].unique()))
-    for country in countries:
-        df = make_var_frame(country, (start_year, end_year), energy_sa, co2_sa)
-        rows = int(len(df))
-        if rows >= min_obs:
-            summary[country] = {"rows": rows, "status": "ready", "reason": ""}
-        elif rows > 0:
-            summary[country] = {
-                "rows": rows,
-                "status": "insufficient",
-                "reason": f"{rows} observaciones válidas en {start_year}-{end_year}",
-            }
-        else:
-            summary[country] = {
-                "rows": rows,
-                "status": "insufficient",
-                "reason": "sin combinaciones completas de CO₂, PIB y generación",
-            }
-    for name, reason in VAR_EXCLUDED_COUNTRIES.items():
-        summary[name] = {"rows": 0, "status": "excluded", "reason": reason}
-    return summary
+) -> pd.Series:
+    if indicator_key == "co2_total":
+        df = co2_sa[co2_sa["country"] == country]
+        if "co2" not in df.columns:
+            return pd.Series(dtype="float64")
+        series = df.set_index("year")["co2"]
+    elif indicator_key == "renewables_share":
+        df = energy_sa[energy_sa["country"] == country]
+        series = compute_renewables_share_timeseries(df)
+    elif indicator_key == "primary_energy":
+        df = energy_sa[energy_sa["country"] == country]
+        if "primary_energy_consumption" not in df.columns:
+            return pd.Series(dtype="float64")
+        series = df.set_index("year")["primary_energy_consumption"]
+    else:
+        return pd.Series(dtype="float64")
+    return _clean_year_series(series)
+
+def auto_arima_forecast(series: pd.Series, horizon: int) -> dict:
+    y = _clean_year_series(series)
+    if y.empty or len(y) < FORECAST_MIN_OBS:
+        raise ValueError("Serie insuficiente para pronosticar.")
+    dt_index = pd.to_datetime(y.index.astype(str), format="%Y", errors="coerce")
+    mask = ~dt_index.isna()
+    y = y.loc[mask]
+    dt_index = dt_index[mask]
+    if y.empty:
+        raise ValueError("Serie sin años válidos.")
+    y.index = pd.PeriodIndex(dt_index, freq="Y").to_timestamp()
+    y = y[~y.index.duplicated(keep="last")].sort_index()
+    best_res = None
+    best_order = None
+    best_aic = np.inf
+    for p in range(FORECAST_MAX_PDQ + 1):
+        for d in range(FORECAST_MAX_PDQ + 1):
+            for q in range(FORECAST_MAX_PDQ + 1):
+                try:
+                    model = ARIMA(
+                        y,
+                        order=(p, d, q),
+                        enforce_stationarity=False,
+                        enforce_invertibility=False,
+                    )
+                    res = model.fit()
+                except Exception:
+                    continue
+                if res.aic < best_aic:
+                    best_res = res
+                    best_order = (p, d, q)
+                    best_aic = res.aic
+    if best_res is None or best_order is None:
+        raise RuntimeError("No se pudo ajustar un ARIMA.")
+    fc = best_res.get_forecast(steps=horizon)
+    mean = fc.predicted_mean
+    ci = fc.conf_int(alpha=0.05)
+    lower = ci.iloc[:, 0]
+    upper = ci.iloc[:, 1]
+    history_df = pd.DataFrame({
+        "year": y.index.year.astype(int),
+        "valor": y.values.astype(float),
+        "tipo": "Observado",
+    })
+    forecast_df = pd.DataFrame({
+        "year": mean.index.year.astype(int),
+        "valor": mean.values.astype(float),
+        "tipo": "Pronóstico",
+        "lower": lower.values.astype(float),
+        "upper": upper.values.astype(float),
+    })
+    return {
+        "history": history_df,
+        "forecast": forecast_df,
+        "order": best_order,
+        "aic": float(best_aic) if np.isfinite(best_aic) else np.nan,
+        "train_obs": int(len(y)),
+        "last_value": float(history_df["valor"].iloc[-1]),
+        "last_year": int(history_df["year"].iloc[-1]),
+    }
+
+# ---------------------------#
+# Modelo alternativo: elasticidad CO₂-PIB
+# ---------------------------#
+def fit_log_elasticity(df: pd.DataFrame, min_obs: int = ELASTICITY_MIN_OBS) -> dict:
+    work = df.dropna(subset=["co2", "gdp"]).copy()
+    if work.empty:
+        raise ValueError("No hay datos de CO₂ y PIB.")
+    work = work[(work["co2"] > 0) & (work["gdp"] > 0)]
+    if len(work) < min_obs:
+        raise ValueError(f"Se requieren ≥{min_obs} observaciones positivas.")
+    work = work.sort_values("year")
+    log_gdp = np.log(work["gdp"].astype(float))
+    log_co2 = np.log(work["co2"].astype(float))
+    slope, intercept = np.polyfit(log_gdp, log_co2, 1)
+    fitted = slope * log_gdp + intercept
+    ss_res = float(np.sum((log_co2 - fitted) ** 2))
+    ss_tot = float(np.sum((log_co2 - log_co2.mean()) ** 2))
+    r2 = np.nan if ss_tot == 0 else 1 - (ss_res / ss_tot)
+    work = work.assign(
+        log_gdp=log_gdp,
+        log_co2=log_co2,
+        fitted=np.exp(fitted),
+    )
+    return {
+        "slope": float(slope),
+        "intercept": float(intercept),
+        "r2": float(r2),
+        "data": work,
+        "observations": int(len(work)),
+    }
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def elasticity_league_table(co2_sa: pd.DataFrame, min_obs: int = ELASTICITY_MIN_OBS) -> pd.DataFrame:
+    rows = []
+    for country, df_country in co2_sa.groupby("country"):
+        try:
+            result = fit_log_elasticity(df_country, min_obs=min_obs)
+        except Exception:
+            continue
+        rows.append({
+            "country": country,
+            "elasticity": result["slope"],
+            "r2": result["r2"],
+            "observations": result["observations"],
+            "year_start": int(df_country["year"].min()),
+            "year_end": int(df_country["year"].max()),
+        })
+    if not rows:
+        return pd.DataFrame()
+    ranking = pd.DataFrame(rows)
+    ranking = ranking.sort_values("elasticity", ascending=False)
+    return ranking
 
 # ---------------------------#
 # Sidebar (controles)
@@ -474,19 +569,6 @@ for w in (validate_energy(energy) + validate_co2(co2)):
 # Filtrar Sudamérica
 energy_sa = energy[energy["iso_code"].isin(SOUTH_AMERICA_ISO)].copy()
 co2_sa    = co2[co2["iso_code"].isin(SOUTH_AMERICA_ISO)].copy()
-
-energy_var = energy_sa[energy_sa["year"].between(VAR_START_YEAR, VAR_END_YEAR)].copy()
-co2_var    = co2_sa[co2_sa["year"].between(VAR_START_YEAR, VAR_END_YEAR)].copy()
-
-VAR_COUNTRY_META = summarize_var_availability(
-    energy_var, co2_var, VAR_START_YEAR, VAR_END_YEAR, VAR_MIN_OBS
-)
-VAR_READY_COUNTRIES = sorted(
-    [c for c, meta in VAR_COUNTRY_META.items() if meta["status"] == "ready"]
-)
-VAR_LIMITED_COUNTRIES = {
-    c: meta for c, meta in VAR_COUNTRY_META.items() if meta["status"] != "ready"
-}
 
 # Controles
 country_list = list_sa_countries(energy)
@@ -566,12 +648,13 @@ else:
 # ---------------------------#
 # Tabs
 # ---------------------------#
-tab_mix, tab_co2, tab_rank, tab_map, tab_var, tab_data = st.tabs([
+tab_mix, tab_co2, tab_rank, tab_map, tab_forecast, tab_elasticity, tab_data = st.tabs([
     "Mezcla eléctrica",
     "Emisiones CO₂",
     "Ranking renovables",
     "Mapa regional",
-    "Modelo VAR",
+    "Pronósticos",
+    "Elasticidad CO₂/PIB",
     "Datos / Descargas"
 ])
 
@@ -653,130 +736,206 @@ with tab_map:
     else:
         st.info("Activa el mapa en la barra lateral.")
 
-# ---- Modelo VAR ----
-with tab_var:
-    st.subheader(f"Modelo VAR — {country}")
-    st.caption(
-        f"Ventana del modelo: {VAR_START_YEAR}–{VAR_END_YEAR} "
-        f"(se requieren ≥{VAR_MIN_OBS} observaciones con CO₂, PIB, renovables y generación)."
+# ---- Pronósticos ----
+with tab_forecast:
+    st.subheader(f"Pronósticos ARIMA - {country}")
+    st.caption("Modelos univariantes (p,d,q <= 2) con intervalos de confianza del 95%.")
+    indicator_keys = list(FORECAST_INDICATORS.keys())
+    indicator_key = st.selectbox(
+        "Indicador a pronosticar",
+        indicator_keys,
+        format_func=lambda k: FORECAST_INDICATORS[k]["label"],
+        key=f"forecast_indicator_{country}",
     )
-    if VAR_LIMITED_COUNTRIES:
-        limited_text = ", ".join(
-            f"{name} ({meta['reason']})" for name, meta in VAR_LIMITED_COUNTRIES.items()
-        )
-        st.warning("Países sin VAR disponible: " + limited_text)
-    st.info(
-        "Instrucciones VAR:\n"
-        "1. Selecciona un país con cobertura completa.\n"
-        "2. Elige al menos dos variables (lo ideal son CO₂, PIB y % renovables).\n"
-        "3. Mantén el rango fijo 2000–2022; los controles de arriba no afectan al modelo.\n"
-        "4. Revisa las pruebas de ADF antes de estimar y asegura ≥12 observaciones tras la transformación."
-    )
-
-    with st.expander("Configuración del modelo", expanded=True):
-        vars_catalog = {
-            "Emisiones CO₂ (Mt)": "co2",
-            "PIB (USD corrientes)": "gdp",
-            "% Renovables en generación": "ren_share",
-            "Generación eléctrica (TWh)": "elec_gen",
-        }
-        var_labels = list(vars_catalog.keys())
-        sel = st.multiselect("Variables (elige 2 a 4):", var_labels,
-                             default=["Emisiones CO₂ (Mt)", "% Renovables en generación", "PIB (USD corrientes)"])
-        vars_sel = [vars_catalog[v] for v in sel]
-        transform = st.selectbox("Transformación", ["logdiff","pctchg","levels"], index=0,
-                                 help="logdiff: Δlog(x); pctchg: % cambio; levels: sin cambios (si ya son estacionarias).")
-        maxlags = st.slider("Máximo rezago para selección por AIC", 1, 6, 4)
-        irf_h   = st.slider("Horizonte IRF (años)", 1, 12, 8)
-        run = st.button("🧮 Estimar VAR", type="primary")
-
-    var_window = (VAR_START_YEAR, VAR_END_YEAR)
-    df_var = make_var_frame(country, var_window, energy_var, co2_var)
-    if country not in VAR_READY_COUNTRIES:
-        reason = VAR_COUNTRY_META.get(country, {}).get("reason", "datos insuficientes.")
-        st.info(f"No es posible estimar el VAR para {country}: {reason}")
-    elif df_var.empty:
-        st.info("No hay suficientes datos combinados para este país y rango.")
-    elif len(vars_sel) < 2:
-        st.info("Selecciona al menos 2 variables para el VAR.")
+    indicator_meta = FORECAST_INDICATORS[indicator_key]
+    st.caption(indicator_meta["description"])
+    horizon = st.slider("Horizonte de pronóstico (años)", 1, 10, 5)
+    series = get_indicator_series(country, indicator_key, energy_sa, co2_sa)
+    if series.empty:
+        st.info("No hay datos históricos suficientes para este indicador/país.")
     else:
-        X = transform_for_var(df_var, vars_sel, transform)
-        st.markdown("**Ventana del modelo (tras transformaciones):**")
-        st.write(f"{X.index.min()} — {X.index.max()}  ·  Observaciones: {len(X)}")
-        st.dataframe(X.tail())
-
-        cols_adf = st.columns(len(vars_sel))
-        for i, c in enumerate(vars_sel):
-            res = adf_result(X[c])
-            ptxt = f"p={res['p']:.3f}" if not np.isnan(res['p']) else "—"
-            cols_adf[i].metric(f"ADF: {c}", ptxt, help="H0: raíz unitaria (no estacionaria)")
-
-        if run:
-            if len(X) < (maxlags + 8):
-                st.warning("Pocas observaciones para ese máximo de rezagos. Reduce 'máximo rezago' o amplía el rango.")
+        min_year = int(series.index.min())
+        max_year = int(series.index.max())
+        if min_year == max_year:
+            st.info("Se necesitan >=2 observaciones para entrenar el ARIMA.")
+        else:
+            default_start = max(min_year, max_year - 30)
+            if default_start > max_year:
+                default_start = min_year
+            hist_range = st.slider(
+                "Rango histórico utilizado",
+                min_year,
+                max_year,
+                (default_start, max_year),
+                key=f"forecast_range_{indicator_key}_{country}",
+            )
+            mask = (series.index >= hist_range[0]) & (series.index <= hist_range[1])
+            subset = series.loc[mask].dropna()
+            if len(subset) < FORECAST_MIN_OBS:
+                st.warning(
+                    f"Se requieren >={FORECAST_MIN_OBS} observaciones para estimar el modelo. "
+                    "Amplía el rango histórico."
+                )
             else:
                 try:
-                    sel_order = VAR(X).select_order(maxlags=maxlags)
-                    p_opt = int(sel_order.aic)
-                    st.success(f"Rezago óptimo por AIC: p = {p_opt}")
+                    forecast_res = auto_arima_forecast(subset, horizon)
+                except Exception as exc:
+                    st.error("No se pudo ajustar el ARIMA para este indicador.")
+                    st.exception(exc)
+                else:
+                    fc_df = forecast_res["forecast"]
+                    last_fc = float(fc_df["valor"].iloc[-1])
+                    delta = last_fc - forecast_res["last_value"]
+                    cols = st.columns(3)
+                    cols[0].metric(
+                        "Último dato observado",
+                        fmt(forecast_res["last_value"], 2),
+                        f"Año {forecast_res['last_year']}",
+                    )
+                    cols[1].metric(
+                        "Orden ARIMA (p,d,q)",
+                        str(forecast_res["order"]),
+                        f"AIC {fmt(forecast_res['aic'], 1)}",
+                    )
+                    cols[2].metric(
+                        f"Pronóstico {int(fc_df['year'].iloc[-1])}",
+                        fmt(last_fc, 2),
+                        fmt(delta, 2),
+                    )
 
-                    model = VAR(X).fit(p_opt)
-                    st.markdown("**Resumen VAR:**")
-                    st.text(model.summary())
-
-                    st.markdown("**Causalidad de Granger (p-valores):**")
-                    rows = []
-                    for caused, causing in itertools.permutations(X.columns, 2):
-                        try:
-                            test = model.test_causality(caused, causing, kind='f')
-                            rows.append({"causado": caused, "causal": causing, "p_value": float(test.pvalue)})
-                        except Exception:
-                            rows.append({"causado": caused, "causal": causing, "p_value": np.nan})
-                    mat = pd.DataFrame(rows).pivot(index="causado", columns="causal", values="p_value").round(3)
-                    st.dataframe(mat)
-
-                    st.markdown("**Funciones Impulso–Respuesta (IRF):**")
-                    irf = model.irf(irf_h)
-                    for resp in X.columns:
-                        curves = []
-                        for shock in X.columns:
-                            vals = irf.irfs[:, X.columns.get_loc(resp), X.columns.get_loc(shock)]
-                            curves.append(pd.DataFrame({
-                                "h": np.arange(irf_h+1),
-                                "respuesta": resp, "shock": shock, "valor": vals
-                            }))
-                        df_plot = pd.concat(curves, ignore_index=True)
-
-                        # 🎨 IRF con colores intensos y leyenda horizontal
-                        fig_irf = px.line(
-                            df_plot, x="h", y="valor", color="shock",
-                            title=f"IRF de {resp} (shock por variable)",
-                            labels={"h": "horizonte (años)", "valor": "respuesta acumulada"},
-                            color_discrete_sequence=[
-                                "#FF6B6B", "#FFD93D", "#6BCB77",
-                                "#4D96FF", "#C77DFF", "#FF9F1C"
-                            ]
+                    hist_df = forecast_res["history"]
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Scatter(
+                            x=hist_df["year"],
+                            y=hist_df["valor"],
+                            mode="lines+markers",
+                            name="Observado",
+                            line=dict(width=3),
                         )
-                        fig_irf.update_traces(line=dict(width=3))
-                        fig_irf.update_layout(
-                            height=420,
-                            margin=dict(l=10, r=10, t=50, b=20),
-                            legend_title_text="Shock",
-                            legend=dict(
-                                orientation="h",
-                                yanchor="bottom", y=-0.35,
-                                xanchor="center", x=0.5,
-                                font=dict(size=12)
-                            ),
-                            title=dict(font=dict(size=18))
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fc_df["year"],
+                            y=fc_df["valor"],
+                            mode="lines+markers",
+                            name="Pronóstico",
+                            line=dict(width=3, dash="dash"),
                         )
-                        st.plotly_chart(fig_irf, use_container_width=True,
-                                        key=f"irf_{resp}_{country}_{yr[0]}_{yr[1]}")
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fc_df["year"],
+                            y=fc_df["upper"],
+                            mode="lines",
+                            line=dict(width=0),
+                            showlegend=False,
+                            hoverinfo="skip",
+                        )
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fc_df["year"],
+                            y=fc_df["lower"],
+                            mode="lines",
+                            line=dict(width=0),
+                            fill="tonexty",
+                            fillcolor="rgba(77,150,255,0.20)",
+                            name="IC 95%",
+                            hovertemplate="Año %{x}<br>IC inferior: %{y:.2f}<extra></extra>",
+                        )
+                    )
+                    fig.update_layout(
+                        height=600,
+                        margin=dict(l=10, r=10, t=60, b=20),
+                        xaxis_title="Año",
+                        yaxis_title=indicator_meta["label"],
+                    )
+                    st.plotly_chart(
+                        fig,
+                        use_container_width=True,
+                        key=f"forecast_chart_{indicator_key}_{country}",
+                    )
 
-                except Exception as e:
-                    st.error("Falló la estimación del VAR.")
-                    st.exception(e)
-                    st.info("Revisa que las variables no sean colineales o que haya observaciones suficientes tras la transformación.")
+                    fc_table = fc_df[["year", "valor", "lower", "upper"]].rename(
+                        columns={
+                            "year": "Año",
+                            "valor": "Pronóstico",
+                            "lower": "IC inf. 95%",
+                            "upper": "IC sup. 95%",
+                        }
+                    )
+                    st.dataframe(fc_table.round(2), use_container_width=True)
+
+# ---- Elasticidad CO₂/PIB ----
+with tab_elasticity:
+    st.subheader(f"Elasticidad CO₂ - PIB · {country}")
+    st.caption("Regresión log-log: una elasticidad de 1 implica que un crecimiento del 1% en el PIB se asocia con +1% en CO₂.")
+    if c_c.empty or "gdp" not in c_c.columns:
+        st.info("No hay datos suficientes de PIB y CO₂ para este país/rango.")
+    else:
+        try:
+            elasticity_res = fit_log_elasticity(c_c, min_obs=ELASTICITY_MIN_OBS)
+        except ValueError as exc:
+            st.warning(str(exc))
+        else:
+            slope = elasticity_res["slope"]
+            r2 = elasticity_res["r2"]
+            obs = elasticity_res["observations"]
+            cols = st.columns(3)
+            cols[0].metric("Elasticidad CO₂/PIB", f"{slope:.2f}")
+            cols[1].metric("R² (ajuste log-log)", f"{r2:.2f}" if np.isfinite(r2) else "n/a")
+            cols[2].metric("Observaciones", str(obs))
+
+            scatter_df = elasticity_res["data"]
+            fig_elast = px.scatter(
+                scatter_df,
+                x="gdp",
+                y="co2",
+                color="year",
+                labels={"gdp": "PIB (USD corrientes)", "co2": "Emisiones CO₂ (Mt)", "year": "Año"},
+                title="Relación CO₂ vs PIB (escala logarítmica)",
+            )
+            fig_elast.update_traces(marker=dict(size=9, line=dict(width=0)))
+            fig_elast.update_xaxes(type="log")
+            fig_elast.update_yaxes(type="log")
+            line_df = scatter_df.sort_values("gdp")
+            fig_elast.add_trace(
+                go.Scatter(
+                    x=line_df["gdp"],
+                    y=line_df["fitted"],
+                    mode="lines",
+                    name="Ajuste log-log",
+                    line=dict(color="#FFD93D", width=3),
+                )
+            )
+            fig_elast.update_layout(
+                height=620,
+                margin=dict(l=10, r=10, t=60, b=20),
+            )
+            st.plotly_chart(
+                fig_elast,
+                use_container_width=True,
+                key=f"elasticity_chart_{country}_{yr[0]}_{yr[1]}",
+            )
+
+    league = elasticity_league_table(co2_sa)
+    if league.empty:
+        st.info("No fue posible construir el ranking regional de elasticidades.")
+    else:
+        st.markdown("**Ranking regional de elasticidades (CO₂ vs PIB, log-log)**")
+        st.caption("Calculado sobre toda la historia disponible de OWID para cada país (solo si hay ≥6 observaciones positivas).")
+        st.dataframe(
+            league.rename(columns={
+                "country": "País",
+                "elasticity": "Elasticidad",
+                "r2": "R²",
+                "observations": "Obs.",
+                "year_start": "Año inicial",
+                "year_end": "Año final",
+            }).reset_index(drop=True).round({"Elasticidad": 2, "R²": 2}),
+            use_container_width=True,
+        )
 
 # ---- Datos y descargas ----
 with tab_data:
