@@ -276,11 +276,26 @@ def last_nonnull(df: pd.DataFrame, col: str):
     s = df[col].dropna()
     return None if s.empty else s.iloc[-1]
 
-def fmt(x, d=2, default="—"):
+def fmt(x, d=2, default="-"):
     try:
         return f"{float(x):,.{d}f}"
     except Exception:
         return default
+
+@st.cache_data(show_spinner=False, ttl=60*60)
+def filter_south_america(df: pd.DataFrame) -> pd.DataFrame:
+    subset = df[df["iso_code"].isin(SOUTH_AMERICA_ISO)].copy()
+    if "year" in subset.columns:
+        subset = subset.sort_values("year")
+    return subset
+
+@st.cache_data(show_spinner=False, ttl=60*10)
+def slice_country_period(df: pd.DataFrame, country: str, start_year: int, end_year: int) -> pd.DataFrame:
+    mask = (df["country"] == country) & (df["year"].between(start_year, end_year))
+    subset = df.loc[mask].copy()
+    if "year" in subset.columns:
+        subset = subset.sort_values("year")
+    return subset.reset_index(drop=True)
 
 # ---------------------------#
 # Logo loader robusto
@@ -566,9 +581,9 @@ except Exception as e:
 for w in (validate_energy(energy) + validate_co2(co2)):
     st.warning("• " + w)
 
-# Filtrar Sudamérica
-energy_sa = energy[energy["iso_code"].isin(SOUTH_AMERICA_ISO)].copy()
-co2_sa    = co2[co2["iso_code"].isin(SOUTH_AMERICA_ISO)].copy()
+# Filtrar Sudamérica con caché liviano
+energy_sa = filter_south_america(energy)
+co2_sa    = filter_south_america(co2)
 
 # Controles
 country_list = list_sa_countries(energy)
@@ -581,9 +596,9 @@ with st.sidebar:
     show_pct = st.checkbox("Mezcla eléctrica en %", value=True)
     show_map = st.checkbox("Ver mapa de renovables (último año)", value=True)
 
-# Filtrado por país y años
-e_c = energy_sa[(energy_sa["country"]==country) & (energy_sa["year"].between(yr[0], yr[1]))].copy()
-c_c = co2_sa[(co2_sa["country"]==country) & (co2_sa["year"].between(yr[0], yr[1]))].copy()
+# Filtrado por país y años (cacheado para evitar copiar dataframes completos)
+e_c = slice_country_period(energy_sa, country, yr[0], yr[1])
+c_c = slice_country_period(co2_sa, country, yr[0], yr[1])
 
 # ---------------------------#
 # Header con logo y título
